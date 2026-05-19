@@ -1,0 +1,18 @@
+# Voice Assistant — Python 3.11+ on macOS Apple Silicon
+#
+# Install pywhispercpp with Metal acceleration:
+#   CMAKE_ARGS="-DWHISPER_METAL=ON" pip install pywhispercpp
+#
+# Install everything else normally:
+#   pip install -r requirements.txt
+
+numpy>=1.24.0,<2.0.0
+sounddevice>=0.4.6,<0.5.0
+pynput>=1.7.6,<1.8.0
+pyperclip>=1.8.2,<1.9.0
+pyautogui>=0.9.54,<1.0.0
+ollama>=0.4.0,<1.0.0
+
+# Install AFTER the above, with Metal flag:
+# CMAKE_ARGS="-DWHISPER_METAL=ON" pip install pywhispercpp
+pywhispercpp>=1.2.0,<2.0.0
