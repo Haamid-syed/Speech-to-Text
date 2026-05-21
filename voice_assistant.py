@@ -61,7 +61,7 @@ HOTKEY_DICTATION  = {Key.cmd, Key.shift, KeyCode(char='0')}
 # Mode 2: Answer — transcribe, LLM answers, paste response
 HOTKEY_ANSWER     = {Key.cmd, Key.shift, KeyCode(char='9')}
 
-WHISPER_MODEL     = "mlx-community/whisper-medium.en-mlx-4bit"
+WHISPER_MODEL     = "mlx-community/whisper-large-v3-turbo-q4"
 SAMPLE_RATE       = 16000
 CHANNELS          = 1
 MIN_RECORDING_S   = 0.3
@@ -258,6 +258,29 @@ def transcribe(model_repo: str, audio: np.ndarray) -> Optional[str]:
     try:
         # mlx-whisper expects float32 in [-1, 1]
         audio_f32 = audio.astype(np.float32) / 32768.0
+
+        # --- Silence Trimmer (VAD) ---
+        # Calculate energy in 100ms chunks to find speech boundaries
+        chunk_size = int(SAMPLE_RATE * 0.1)
+        if len(audio_f32) > chunk_size * 2:
+            pad_len = chunk_size - (len(audio_f32) % chunk_size)
+            padded = np.pad(audio_f32, (0, pad_len)) if pad_len != chunk_size else audio_f32
+            
+            chunks = padded.reshape(-1, chunk_size)
+            energies = np.sqrt(np.mean(chunks**2, axis=1))
+            
+            # 0.005 threshold (approx 0.5% max volume) catches speech but ignores room noise
+            speech_idx = np.where(energies > 0.005)[0]
+            
+            if len(speech_idx) > 0:
+                # Keep 200ms before, 300ms after to avoid cutting off breaths/tails
+                start_idx = max(0, (speech_idx[0] - 2) * chunk_size)
+                end_idx = min(len(audio_f32), (speech_idx[-1] + 3) * chunk_size)
+                audio_f32 = audio_f32[start_idx:end_idx]
+            else:
+                log_warn("Nothing detected — recording was pure silence.")
+                return None
+        # -----------------------------
 
         result = mlx_whisper.transcribe(
             audio_f32,
