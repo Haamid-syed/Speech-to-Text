@@ -34,6 +34,7 @@ venv.bak/
 # Project specific
 context.md
 run.sh
+benchmark.py
 
 # IDE / Editor
 .vscode/*

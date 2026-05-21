@@ -2,8 +2,11 @@
 """
 Local Voice Assistant for macOS (Apple Silicon)
 Two modes:
-  Cmd+Shift+.  →  Dictation (transcribe → LLM refine → paste clean text)
-  Cmd+Shift+,  →  Answer    (transcribe → LLM answer → paste response)
+  Cmd+Shift+0  →  Dictation (transcribe → paste raw text)
+  Cmd+Shift+9  →  Answer    (transcribe → LLM answer → paste response)
+
+STT: mlx-whisper (Apple MLX) with quantized medium.en
+LLM: Ollama (qwen2.5:1.5b)
 """
 
 import signal
@@ -25,9 +28,11 @@ except ImportError:
     _ollama = None  # type: ignore[assignment]
 
 try:
-    from pywhispercpp.model import Model as WhisperModel
+    import mlx_whisper
+    HAS_MLX_WHISPER = True
 except ImportError:
-    WhisperModel = None  # type: ignore[assignment,misc]
+    mlx_whisper = None  # type: ignore[assignment]
+    HAS_MLX_WHISPER = False
 
 import pyperclip
 
@@ -35,12 +40,15 @@ try:
     import Quartz
     from Quartz import (
         CGEventCreateKeyboardEvent,
+        CGEventSetFlags,
         CGEventPost,
         kCGEventTapLocation,
         kCGHIDEventTap,
         kCGEventKeyDown,
         kCGEventKeyUp,
+        kCGEventFlagMaskCommand,
     )
+    from Quartz.CoreGraphics import CGEventSourceCreate, kCGEventSourceStateHIDSystemState
     HAS_QUARTZ = True
 except ImportError:
     HAS_QUARTZ = False
@@ -53,7 +61,7 @@ HOTKEY_DICTATION  = {Key.cmd, Key.shift, KeyCode(char='0')}
 # Mode 2: Answer — transcribe, LLM answers, paste response
 HOTKEY_ANSWER     = {Key.cmd, Key.shift, KeyCode(char='9')}
 
-WHISPER_MODEL     = "small.en"
+WHISPER_MODEL     = "mlx-community/whisper-medium.en-mlx-4bit"
 SAMPLE_RATE       = 16000
 CHANNELS          = 1
 MIN_RECORDING_S   = 0.3
@@ -217,40 +225,48 @@ def start_audio_stream() -> sd.InputStream:
     return stream
 
 
-# ── STT (whisper.cpp) ────────────────────────────────────────────────────────
+# ── STT (mlx-whisper) ────────────────────────────────────────────────────────
 
-def load_whisper_model() -> "WhisperModel":
-    """Load the pywhispercpp model once. Exits on failure."""
-    if WhisperModel is None:
+def load_whisper_model() -> str:
+    """Validate mlx-whisper is installed and warm up the model. Returns model repo string."""
+    if not HAS_MLX_WHISPER:
         log_error(
-            "pywhispercpp is not installed.\n"
-            '   → Install with: CMAKE_ARGS="-DWHISPER_METAL=ON" pip install pywhispercpp'
+            "mlx-whisper is not installed.\n"
+            "   → Install with: pip install mlx-whisper"
         )
         sys.exit(1)
 
     try:
-        model = WhisperModel(WHISPER_MODEL)
-        log_status(f"✅  Whisper model '{WHISPER_MODEL}' loaded")
-        return model
+        # Warm up: run a tiny silent transcription to download/cache the model
+        log_status(f"⏳  Loading Whisper model '{WHISPER_MODEL}'...")
+        dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1 second of silence
+        mlx_whisper.transcribe(dummy, path_or_hf_repo=WHISPER_MODEL)
+        log_status(f"✅  Whisper model '{WHISPER_MODEL}' loaded (mlx-whisper)")
+        return WHISPER_MODEL
     except Exception as e:
         log_error(
             f"Failed to load Whisper model '{WHISPER_MODEL}': {e}\n"
-            '   → Ensure model is available. Try:\n'
-            f'     pip install pywhispercpp  (model "{WHISPER_MODEL}" downloads automatically)\n'
-            '   → For Metal acceleration on Apple Silicon:\n'
-            '     CMAKE_ARGS="-DWHISPER_METAL=ON" pip install pywhispercpp'
+            "   → Ensure model is available. Try:\n"
+            f"     pip install mlx-whisper\n"
+            f"     Model '{WHISPER_MODEL}' downloads automatically from HuggingFace."
         )
         sys.exit(1)
 
 
-def transcribe(model: "WhisperModel", audio: np.ndarray) -> Optional[str]:
-    """Run whisper.cpp on int16 audio, return cleaned text or None."""
+def transcribe(model_repo: str, audio: np.ndarray) -> Optional[str]:
+    """Run mlx-whisper on int16 audio, return cleaned text or None."""
     try:
-        # pywhispercpp expects float32 in [-1, 1]
+        # mlx-whisper expects float32 in [-1, 1]
         audio_f32 = audio.astype(np.float32) / 32768.0
 
-        segments = model.transcribe(audio_f32)
-        text = " ".join(seg.text.strip() for seg in segments).strip()
+        result = mlx_whisper.transcribe(
+            audio_f32,
+            path_or_hf_repo=model_repo,
+            condition_on_previous_text=False,  # Huge speedup, prevents looping hallucinations
+            temperature=0.0,                   # Pure deterministic (no slow fallback loops)
+            initial_prompt="Hello, this is a clear dictation.", # Forces proper punctuation/capitalization
+        )
+        text = result.get("text", "").strip()
 
         if not text:
             log_warn("Nothing detected — empty transcription.")
@@ -289,6 +305,11 @@ def query_llm(prompt: str, system_prompt: str) -> Optional[str]:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
+            options={
+                "num_ctx": 1024,      # Reduce context window (faster processing, less RAM)
+                "num_predict": 250,   # Limit response length (prevents infinite rambling)
+                "temperature": 0.3,   # Lower temp for faster, more direct answers
+            }
         )
         return response["message"]["content"].strip()
 
@@ -326,33 +347,27 @@ def query_llm(prompt: str, system_prompt: str) -> Optional[str]:
 
 # ── PASTE ─────────────────────────────────────────────────────────────────────
 
-# Virtual keycodes for macOS
-_VK_CMD  = 0x37
+# Virtual keycode for 'v' on macOS
 _VK_V    = 0x09
 
 def _quartz_paste() -> bool:
-    """Paste via Quartz/CoreGraphics — most reliable, doesn't steal focus."""
+    """Paste via Quartz/CoreGraphics — uses flagged Cmd+V events for cross-app reliability."""
     if not HAS_QUARTZ:
         return False
     try:
-        # Cmd down
-        cmd_down = CGEventCreateKeyboardEvent(None, _VK_CMD, True)
-        CGEventPost(kCGHIDEventTap, cmd_down)
-        time.sleep(0.02)
+        source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState)
 
-        # V down
-        v_down = CGEventCreateKeyboardEvent(None, _VK_V, True)
+        # V key down with Command flag
+        v_down = CGEventCreateKeyboardEvent(source, _VK_V, True)
+        CGEventSetFlags(v_down, kCGEventFlagMaskCommand)
+
+        # V key up with Command flag
+        v_up = CGEventCreateKeyboardEvent(source, _VK_V, False)
+        CGEventSetFlags(v_up, kCGEventFlagMaskCommand)
+
+        # Post the events
         CGEventPost(kCGHIDEventTap, v_down)
-        time.sleep(0.02)
-
-        # V up
-        v_up = CGEventCreateKeyboardEvent(None, _VK_V, False)
         CGEventPost(kCGHIDEventTap, v_up)
-        time.sleep(0.02)
-
-        # Cmd up
-        cmd_up = CGEventCreateKeyboardEvent(None, _VK_CMD, False)
-        CGEventPost(kCGHIDEventTap, cmd_up)
         return True
     except Exception:
         return False
@@ -399,12 +414,12 @@ def paste_text(text: str) -> None:
 
 # ── PIPELINE ──────────────────────────────────────────────────────────────────
 
-def run_pipeline(model: "WhisperModel", audio: np.ndarray, mode: str) -> None:
+def run_pipeline(model_repo: str, audio: np.ndarray, mode: str) -> None:
     """Orchestrate: transcribe → (LLM if answer) → paste. Mode determines behaviour."""
     try:
         # 1. STT
         log_status("⚙️  Transcribing...")
-        text = transcribe(model, audio)
+        text = transcribe(model_repo, audio)
         if text is None:
             return
 
@@ -440,7 +455,7 @@ def run_pipeline(model: "WhisperModel", audio: np.ndarray, mode: str) -> None:
 _last_toggle_time: float = 0.0
 _toggle_cooldown_s: float = 0.5  # minimum seconds between toggles
 
-def on_key_press(key: Union[Key, KeyCode, None], model: "WhisperModel") -> None:
+def on_key_press(key: Union[Key, KeyCode, None], model_repo: str) -> None:
     """Handle key press — toggle recording on/off when combo is pressed."""
     global _active_mode, _last_toggle_time
     normalized = _normalize_key(key)
@@ -492,7 +507,7 @@ def on_key_press(key: Union[Key, KeyCode, None], model: "WhisperModel") -> None:
 
         _pipeline_busy.set()
         thread = threading.Thread(
-            target=run_pipeline, args=(model, audio, mode), daemon=True
+            target=run_pipeline, args=(model_repo, audio, mode), daemon=True
         )
         thread.start()
     else:
@@ -507,7 +522,7 @@ def on_key_press(key: Union[Key, KeyCode, None], model: "WhisperModel") -> None:
         log_status(f"🎙  Recording... ({label} mode) — press hotkey again to stop")
 
 
-def on_key_release(key: Union[Key, KeyCode, None], model: "WhisperModel") -> None:
+def on_key_release(key: Union[Key, KeyCode, None], model_repo: str) -> None:
     """Handle key release — just tracks key state, no recording control."""
     normalized = _normalize_key(key)
     if normalized is None:
@@ -526,8 +541,8 @@ def main() -> None:
     # Validate mic before anything else
     validate_microphone()
 
-    # Load whisper model once
-    model = load_whisper_model()
+    # Load/warm-up whisper model once
+    model_repo = load_whisper_model()
 
     # Open persistent audio stream
     stream = start_audio_stream()
@@ -547,8 +562,8 @@ def main() -> None:
 
     # Start keyboard listener
     listener = Listener(
-        on_press=lambda key: on_key_press(key, model),
-        on_release=lambda key: on_key_release(key, model),
+        on_press=lambda key: on_key_press(key, model_repo),
+        on_release=lambda key: on_key_release(key, model_repo),
     )
     listener.start()
 
