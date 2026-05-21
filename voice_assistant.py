@@ -15,13 +15,14 @@ import sys
 import threading
 import time
 import traceback
+import queue
 import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from typing import Optional, Union
+from typing import Optional, Union, Iterator
 
 import numpy as np
 import sounddevice as sd
-from pynput.keyboard import Key, KeyCode, Listener
+from pynput.keyboard import Key, KeyCode, Listener, Controller
 
 try:
     import ollama as _ollama
@@ -61,6 +62,12 @@ try:
 except ImportError:
     HAS_QUARTZ = False
 
+try:
+    import ApplicationServices
+    HAS_APP_SERVICES = True
+except ImportError:
+    HAS_APP_SERVICES = False
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
 # Mode 1: Dictation — transcribe and paste raw text
@@ -75,6 +82,7 @@ CHANNELS          = 1
 MIN_RECORDING_S   = 0.3
 LLM_MODEL         = "qwen2.5:1.5b"
 LLM_TIMEOUT_S     = 15
+LLM_TOKEN_TIMEOUT_S = 5
 PASTE_DELAY_S     = 0.1   # seconds between clipboard write and Cmd+V
 
 ANSWER_PROMPT     = (
@@ -210,6 +218,17 @@ def validate_microphone() -> None:
         sys.exit(1)
 
 
+def validate_accessibility() -> None:
+    """Check that macOS accessibility permissions are granted."""
+    if HAS_APP_SERVICES and not ApplicationServices.AXIsProcessTrusted():
+        log_error(
+            "Accessibility permission denied.\n"
+            "   → Grant access in: System Settings > Privacy & Security > Accessibility\n"
+            "   → Add your terminal app (Terminal / iTerm / VS Code) to the list."
+        )
+        sys.exit(1)
+
+
 def audio_callback(indata: np.ndarray, frames: int, time_info: object, status: object) -> None:
     """Sounddevice stream callback — appends frames while recording."""
     if _is_recording.is_set():
@@ -333,56 +352,83 @@ def transcribe(model_repo: str, audio: np.ndarray) -> Optional[str]:
 
 # ── LLM (Ollama) ─────────────────────────────────────────────────────────────
 
-def query_llm(prompt: str, system_prompt: str) -> Optional[str]:
-    """Send prompt to Ollama with the given system prompt, return response or None."""
+def query_llm_stream(prompt: str, system_prompt: str) -> Iterator[str]:
+    """Send prompt to Ollama with the given system prompt, yield token chunks."""
     if _ollama is None:
         log_error("ollama Python client not installed.\n   → pip install ollama")
-        return None
+        return
 
-    def _call() -> str:
-        response = _ollama.chat(
+    def init_stream():
+        return _ollama.chat(
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
+            stream=True,
             options={
                 "num_ctx": 1024,      # Reduce context window (faster processing, less RAM)
                 "num_predict": 250,   # Limit response length (prevents infinite rambling)
                 "temperature": 0.3,   # Lower temp for faster, more direct answers
             }
         )
-        return response["message"]["content"].strip()
 
     executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_call)
 
     try:
-        result = future.result(timeout=LLM_TIMEOUT_S)
-        if not result:
-            log_warn("LLM returned an empty response.")
-            return None
-        return result
-
+        future = executor.submit(init_stream)
+        response_stream = future.result(timeout=LLM_TIMEOUT_S)
     except FuturesTimeoutError:
-        log_warn(f"LLM timed out after {LLM_TIMEOUT_S}s.")
-        return None
+        log_warn(f"LLM connection timed out after {LLM_TIMEOUT_S}s.")
+        executor.shutdown(wait=False)
+        return
     except Exception as e:
+        executor.shutdown(wait=False)
         if HAS_HTTPX and isinstance(e, httpx.ConnectError):
             log_error("Ollama is not running.\n   → Run: ollama serve")
-            return None
+            return
         if _ollama is not None and isinstance(e, _ollama.ResponseError):
             if getattr(e, "status_code", None) == 404:
                 log_error(f"Model not available.\n   → Run: ollama pull {LLM_MODEL}")
             else:
                 log_error(f"Ollama ResponseError: {e}")
-            return None
-        
-        log_error(f"LLM error: {e}")
+            return
+        log_error(f"LLM init error: {e}")
         traceback.print_exc()
-        return None
+        return
     finally:
         executor.shutdown(wait=False)
+
+    q = queue.Queue()
+
+    def _stream_to_queue():
+        try:
+            for chunk in response_stream:
+                q.put(chunk)
+        except Exception as e:
+            q.put(e)
+        finally:
+            q.put(None)  # sentinel
+
+    thread = threading.Thread(target=_stream_to_queue, daemon=True)
+    thread.start()
+
+    while True:
+        try:
+            item = q.get(timeout=LLM_TOKEN_TIMEOUT_S)
+        except queue.Empty:
+            log_warn(f"LLM timed out after {LLM_TOKEN_TIMEOUT_S}s between tokens.")
+            break
+
+        if item is None:
+            break
+        if isinstance(item, Exception):
+            log_error(f"LLM stream error: {item}")
+            break
+
+        content = item.get("message", {}).get("content", "")
+        if content:
+            yield content
 
 
 # ── PASTE ─────────────────────────────────────────────────────────────────────
@@ -423,6 +469,17 @@ def _osascript_paste() -> bool:
     except Exception:
         return False
 
+def _wait_for_modifiers() -> None:
+    """Wait up to 1 second for physical modifier keys to be released."""
+    _modifiers = {Key.cmd, Key.cmd_l, Key.cmd_r, Key.shift, Key.shift_l, Key.shift_r,
+                  Key.alt, Key.alt_l, Key.alt_r, Key.ctrl, Key.ctrl_l, Key.ctrl_r}
+    for _ in range(20):
+        with _keys_lock:
+            if not _pressed_keys.intersection(_modifiers):
+                break
+        time.sleep(0.05)
+
+
 def paste_text(text: str) -> None:
     """Copy text to clipboard, then paste via Quartz (no focus stealing)."""
     try:
@@ -435,14 +492,7 @@ def paste_text(text: str) -> None:
     # Wait for clipboard to be registered
     time.sleep(PASTE_DELAY_S)
 
-    # Wait for all physical modifier keys to be released
-    _modifiers = {Key.cmd, Key.cmd_l, Key.cmd_r, Key.shift, Key.shift_l, Key.shift_r,
-                  Key.alt, Key.alt_l, Key.alt_r, Key.ctrl, Key.ctrl_l, Key.ctrl_r}
-    for _ in range(20):
-        with _keys_lock:
-            if not _pressed_keys.intersection(_modifiers):
-                break
-        time.sleep(0.05)
+    _wait_for_modifiers()
 
     # Try Quartz first (most reliable), fall back to AppleScript
     if not _quartz_paste():
@@ -470,15 +520,23 @@ def run_pipeline(model_repo: str, audio: np.ndarray, mode: str) -> None:
             paste_text(text)
             log_status("✅  Done")
         else:
-            log_status("🤖  Querying LLM...")
-            response = query_llm(text, ANSWER_PROMPT)
-            if response is None:
-                return
-
-            log_status(f'💬  "{response}"')
-
-            # 3. Paste
-            paste_text(response)
+            log_status("🤖  Querying LLM (streaming)...")
+            
+            _wait_for_modifiers()
+            keyboard = Controller()
+            
+            sys.stdout.write("💬  \"")
+            sys.stdout.flush()
+            
+            for chunk in query_llm_stream(text, ANSWER_PROMPT):
+                if chunk:
+                    # Type the chunk directly
+                    keyboard.type(chunk)
+                    # Also print to terminal for feedback
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                    
+            sys.stdout.write("\"\n")
             log_status("✅  Done")
 
     except Exception as e:
@@ -510,11 +568,6 @@ def on_key_press(key: Union[Key, KeyCode, None], whisper_repo: str) -> None:
     if time.time() - _last_toggle_time < _toggle_cooldown_s:
         return
 
-    # Pipeline still busy — ignore
-    if _pipeline_busy.is_set():
-        log_warn("Still processing...")
-        return
-
     # Check which combo is active (dictation takes priority if both match)
     mode = None
     if _combo_held(HOTKEY_DICTATION):
@@ -523,6 +576,11 @@ def on_key_press(key: Union[Key, KeyCode, None], whisper_repo: str) -> None:
         mode = "answer"
 
     if mode is None:
+        return
+
+    # If it's a hotkey press but pipeline is busy, ignore and warn
+    if _pipeline_busy.is_set():
+        log_warn("Still processing...")
         return
 
     # Toggle behavior
@@ -581,8 +639,9 @@ def main() -> None:
     """Entry point — validates environment, loads model, starts listener."""
     log_status("─── Voice Assistant ───")
 
-    # Validate mic before anything else
+    # Validate environment permissions before anything else
     validate_microphone()
+    validate_accessibility()
 
     # Load/warm-up whisper model once
     whisper_repo = warmup_whisper_model()
