@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import traceback
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Optional, Union
 
@@ -33,6 +34,13 @@ try:
 except ImportError:
     mlx_whisper = None  # type: ignore[assignment]
     HAS_MLX_WHISPER = False
+
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    httpx = None  # type: ignore[assignment]
+    HAS_HTTPX = False
 
 import pyperclip
 
@@ -69,12 +77,6 @@ LLM_MODEL         = "qwen2.5:1.5b"
 LLM_TIMEOUT_S     = 15
 PASTE_DELAY_S     = 0.1   # seconds between clipboard write and Cmd+V
 
-DICTATION_PROMPT  = (
-    "You are a dictation assistant. The user spoke the following text aloud. "
-    "Clean it up: fix grammar, remove filler words (um, uh, like, you know), "
-    "fix punctuation, and make it read naturally. "
-    "Output ONLY the cleaned text — no quotes, no explanation, no preamble."
-)
 ANSWER_PROMPT     = (
     "You are a helpful assistant running locally on the user's computer. "
     "Answer the user's question directly and concisely. "
@@ -104,8 +106,7 @@ _pipeline_busy = threading.Event()
 _audio_frames: list[np.ndarray] = []
 _frames_lock = threading.Lock()
 _pressed_keys: set = set()
-_active_mode: Optional[str] = None   # "dictation" or "answer"
-_mode_lock = threading.Lock()
+_keys_lock = threading.Lock()
 _shutdown = threading.Event()
 
 
@@ -172,7 +173,8 @@ def _normalize_key(key: Union[Key, KeyCode, None]) -> Union[Key, KeyCode, None]:
 
 def _combo_held(combo: set) -> bool:
     """Return True when all keys in the given combo are currently held."""
-    return _pressed_keys.issuperset(combo)
+    with _keys_lock:
+        return _pressed_keys.issuperset(combo)
 
 
 # ── AUDIO ────────────────────────────────────────────────────────────────────
@@ -193,6 +195,8 @@ def validate_microphone() -> None:
 
         # Quick probe to test permissions
         sd.check_input_settings(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16")
+        # Do a tiny test capture to force macOS microphone permission prompt immediately
+        sd.rec(1, samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16", blocking=True)
 
     except PermissionError:
         log_error(
@@ -227,7 +231,7 @@ def start_audio_stream() -> sd.InputStream:
 
 # ── STT (mlx-whisper) ────────────────────────────────────────────────────────
 
-def load_whisper_model() -> str:
+def warmup_whisper_model() -> str:
     """Validate mlx-whisper is installed and warm up the model. Returns model repo string."""
     if not HAS_MLX_WHISPER:
         log_error(
@@ -295,8 +299,22 @@ def transcribe(model_repo: str, audio: np.ndarray) -> Optional[str]:
             log_warn("Nothing detected — empty transcription.")
             return None
 
-        # Filter whisper hallucination artifacts
-        if text.strip() in WHISPER_JUNK:
+        # Filter whisper hallucination tags from the output text
+        for junk in WHISPER_JUNK:
+            if junk.startswith("[") or junk.startswith("("):
+                text = re.sub(re.escape(junk), "", text, flags=re.IGNORECASE).strip()
+
+        if not text:
+            log_warn("Nothing detected — whisper artifact.")
+            return None
+
+        # Check if what's left is ONLY a common phrase hallucination
+        cleaned_text = text.lower()
+        for junk in WHISPER_JUNK:
+            if not (junk.startswith("[") or junk.startswith("(")):
+                cleaned_text = cleaned_text.replace(junk.lower(), "").strip()
+        
+        if not cleaned_text:
             log_warn("Nothing detected — whisper artifact.")
             return None
 
@@ -336,36 +354,35 @@ def query_llm(prompt: str, system_prompt: str) -> Optional[str]:
         )
         return response["message"]["content"].strip()
 
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_call)
-            result = future.result(timeout=LLM_TIMEOUT_S)
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_call)
 
+    try:
+        result = future.result(timeout=LLM_TIMEOUT_S)
         if not result:
             log_warn("LLM returned an empty response.")
             return None
-
         return result
 
     except FuturesTimeoutError:
         log_warn(f"LLM timed out after {LLM_TIMEOUT_S}s.")
         return None
-    except ConnectionError:
-        log_error("Ollama is not running.\n   → Run: ollama serve")
-        return None
     except Exception as e:
-        err_str = str(e).lower()
-        # Detect connection refused (may surface as various exception types)
-        if "connection" in err_str and ("refused" in err_str or "error" in err_str):
+        if HAS_HTTPX and isinstance(e, httpx.ConnectError):
             log_error("Ollama is not running.\n   → Run: ollama serve")
             return None
-        # Detect model not found
-        if "404" in err_str or "not found" in err_str or "model" in err_str:
-            log_error(f"Model not available.\n   → Run: ollama pull {LLM_MODEL}")
+        if _ollama is not None and isinstance(e, _ollama.ResponseError):
+            if getattr(e, "status_code", None) == 404:
+                log_error(f"Model not available.\n   → Run: ollama pull {LLM_MODEL}")
+            else:
+                log_error(f"Ollama ResponseError: {e}")
             return None
+        
         log_error(f"LLM error: {e}")
         traceback.print_exc()
         return None
+    finally:
+        executor.shutdown(wait=False)
 
 
 # ── PASTE ─────────────────────────────────────────────────────────────────────
@@ -416,17 +433,16 @@ def paste_text(text: str) -> None:
         return
 
     # Wait for clipboard to be registered
-    _paste_ready = threading.Event()
-    _paste_ready.wait(timeout=PASTE_DELAY_S)
+    time.sleep(PASTE_DELAY_S)
 
     # Wait for all physical modifier keys to be released
     _modifiers = {Key.cmd, Key.cmd_l, Key.cmd_r, Key.shift, Key.shift_l, Key.shift_r,
                   Key.alt, Key.alt_l, Key.alt_r, Key.ctrl, Key.ctrl_l, Key.ctrl_r}
     for _ in range(20):
-        with _mode_lock:
+        with _keys_lock:
             if not _pressed_keys.intersection(_modifiers):
                 break
-        threading.Event().wait(timeout=0.05)
+        time.sleep(0.05)
 
     # Try Quartz first (most reliable), fall back to AppleScript
     if not _quartz_paste():
@@ -478,15 +494,17 @@ def run_pipeline(model_repo: str, audio: np.ndarray, mode: str) -> None:
 _last_toggle_time: float = 0.0
 _toggle_cooldown_s: float = 0.5  # minimum seconds between toggles
 
-def on_key_press(key: Union[Key, KeyCode, None], model_repo: str) -> None:
+def on_key_press(key: Union[Key, KeyCode, None], whisper_repo: str) -> None:
     """Handle key press — toggle recording on/off when combo is pressed."""
-    global _active_mode, _last_toggle_time
+    global _last_toggle_time
     normalized = _normalize_key(key)
     if normalized is None:
         return
 
-    log_debug(f"PRESS   raw={key!r}  norm={normalized!r}  held={_pressed_keys}")
-    _pressed_keys.add(normalized)
+    with _keys_lock:
+        _pressed_keys.add(normalized)
+        current_keys = set(_pressed_keys)
+    log_debug(f"PRESS   raw={key!r}  norm={normalized!r}  held={current_keys}")
 
     # Debounce: ignore if toggled too recently
     if time.time() - _last_toggle_time < _toggle_cooldown_s:
@@ -510,6 +528,7 @@ def on_key_press(key: Union[Key, KeyCode, None], model_repo: str) -> None:
     # Toggle behavior
     if _is_recording.is_set():
         # Currently recording → stop and trigger pipeline
+        _pipeline_busy.set()
         _is_recording.clear()
         _last_toggle_time = time.time()
         log_status("✋  Stopped")
@@ -519,6 +538,7 @@ def on_key_press(key: Union[Key, KeyCode, None], model_repo: str) -> None:
             _audio_frames.clear()
 
         if not frames:
+            _pipeline_busy.clear()
             return
 
         audio = np.concatenate(frames, axis=0).flatten()
@@ -526,17 +546,15 @@ def on_key_press(key: Union[Key, KeyCode, None], model_repo: str) -> None:
 
         if duration < MIN_RECORDING_S:
             log_warn("Too short, skipping.")
+            _pipeline_busy.clear()
             return
 
-        _pipeline_busy.set()
         thread = threading.Thread(
-            target=run_pipeline, args=(model_repo, audio, mode), daemon=True
+            target=run_pipeline, args=(whisper_repo, audio, mode), daemon=True
         )
         thread.start()
     else:
         # Not recording → start recording
-        with _mode_lock:
-            _active_mode = mode
         with _frames_lock:
             _audio_frames.clear()
         _is_recording.set()
@@ -545,14 +563,16 @@ def on_key_press(key: Union[Key, KeyCode, None], model_repo: str) -> None:
         log_status(f"🎙  Recording... ({label} mode) — press hotkey again to stop")
 
 
-def on_key_release(key: Union[Key, KeyCode, None], model_repo: str) -> None:
+def on_key_release(key: Union[Key, KeyCode, None], whisper_repo: str) -> None:
     """Handle key release — just tracks key state, no recording control."""
     normalized = _normalize_key(key)
     if normalized is None:
         return
 
-    log_debug(f"RELEASE raw={key!r}  norm={normalized!r}  held={_pressed_keys}")
-    _pressed_keys.discard(normalized)
+    with _keys_lock:
+        _pressed_keys.discard(normalized)
+        current_keys = set(_pressed_keys)
+    log_debug(f"RELEASE raw={key!r}  norm={normalized!r}  held={current_keys}")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -565,11 +585,17 @@ def main() -> None:
     validate_microphone()
 
     # Load/warm-up whisper model once
-    model_repo = load_whisper_model()
+    whisper_repo = warmup_whisper_model()
 
     # Open persistent audio stream
     stream = start_audio_stream()
     log_status("🎧  Audio stream open")
+
+    # Start keyboard listener
+    listener = Listener(
+        on_press=lambda key: on_key_press(key, whisper_repo),
+        on_release=lambda key: on_key_release(key, whisper_repo),
+    )
 
     # Graceful shutdown
     def shutdown(signum: int, frame: object) -> None:
@@ -577,17 +603,13 @@ def main() -> None:
         _is_recording.clear()
         stream.stop()
         stream.close()
+        listener.stop()
         log_status("\n👋  Goodbye")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # Start keyboard listener
-    listener = Listener(
-        on_press=lambda key: on_key_press(key, model_repo),
-        on_release=lambda key: on_key_release(key, model_repo),
-    )
     listener.start()
 
     log_status("🚀  Ready!")
