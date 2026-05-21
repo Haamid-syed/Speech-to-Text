@@ -7,8 +7,10 @@ Two modes:
 """
 
 import signal
+import subprocess
 import sys
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Optional, Union
@@ -28,15 +30,28 @@ except ImportError:
     WhisperModel = None  # type: ignore[assignment,misc]
 
 import pyperclip
-import pyautogui
+
+try:
+    import Quartz
+    from Quartz import (
+        CGEventCreateKeyboardEvent,
+        CGEventPost,
+        kCGEventTapLocation,
+        kCGHIDEventTap,
+        kCGEventKeyDown,
+        kCGEventKeyUp,
+    )
+    HAS_QUARTZ = True
+except ImportError:
+    HAS_QUARTZ = False
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-# Mode 1: Dictation — refines your speech into clean text (like Wispr Flow)
-HOTKEY_DICTATION  = {Key.cmd, Key.shift, KeyCode(char='.')}
+# Mode 1: Dictation — transcribe and paste raw text
+HOTKEY_DICTATION  = {Key.cmd, Key.shift, KeyCode(char='0')}
 
-# Mode 2: Answer — sends your speech as a question, pastes the LLM's answer
-HOTKEY_ANSWER     = {Key.cmd, Key.shift, KeyCode(char=',')}
+# Mode 2: Answer — transcribe, LLM answers, paste response
+HOTKEY_ANSWER     = {Key.cmd, Key.shift, KeyCode(char='9')}
 
 WHISPER_MODEL     = "small.en"
 SAMPLE_RATE       = 16000
@@ -311,29 +326,81 @@ def query_llm(prompt: str, system_prompt: str) -> Optional[str]:
 
 # ── PASTE ─────────────────────────────────────────────────────────────────────
 
+# Virtual keycodes for macOS
+_VK_CMD  = 0x37
+_VK_V    = 0x09
+
+def _quartz_paste() -> bool:
+    """Paste via Quartz/CoreGraphics — most reliable, doesn't steal focus."""
+    if not HAS_QUARTZ:
+        return False
+    try:
+        # Cmd down
+        cmd_down = CGEventCreateKeyboardEvent(None, _VK_CMD, True)
+        CGEventPost(kCGHIDEventTap, cmd_down)
+        time.sleep(0.02)
+
+        # V down
+        v_down = CGEventCreateKeyboardEvent(None, _VK_V, True)
+        CGEventPost(kCGHIDEventTap, v_down)
+        time.sleep(0.02)
+
+        # V up
+        v_up = CGEventCreateKeyboardEvent(None, _VK_V, False)
+        CGEventPost(kCGHIDEventTap, v_up)
+        time.sleep(0.02)
+
+        # Cmd up
+        cmd_up = CGEventCreateKeyboardEvent(None, _VK_CMD, False)
+        CGEventPost(kCGHIDEventTap, cmd_up)
+        return True
+    except Exception:
+        return False
+
+def _osascript_paste() -> bool:
+    """Fallback: paste via AppleScript."""
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'tell application "System Events" to keystroke "v" using command down'],
+            check=True, capture_output=True, timeout=5
+        )
+        return True
+    except Exception:
+        return False
+
 def paste_text(text: str) -> None:
-    """Copy text to clipboard, wait briefly, then auto-paste via Cmd+V."""
+    """Copy text to clipboard, then paste via Quartz (no focus stealing)."""
     try:
         pyperclip.copy(text)
     except Exception as e:
         log_warn(f"Clipboard write failed: {e}")
-        log_status(f"📋  LLM response:\n{text}")
+        log_status(f"📋  Text:\n{text}")
         return
 
-    # Brief pause so the OS registers the clipboard content before paste
+    # Wait for clipboard to be registered
     _paste_ready = threading.Event()
     _paste_ready.wait(timeout=PASTE_DELAY_S)
 
-    try:
-        pyautogui.hotkey("command", "v")
-    except Exception as e:
-        log_warn(f"Copied to clipboard (auto-paste failed: {e})")
+    # Wait for all physical modifier keys to be released
+    _modifiers = {Key.cmd, Key.cmd_l, Key.cmd_r, Key.shift, Key.shift_l, Key.shift_r,
+                  Key.alt, Key.alt_l, Key.alt_r, Key.ctrl, Key.ctrl_l, Key.ctrl_r}
+    for _ in range(20):
+        with _mode_lock:
+            if not _pressed_keys.intersection(_modifiers):
+                break
+        threading.Event().wait(timeout=0.05)
+
+    # Try Quartz first (most reliable), fall back to AppleScript
+    if not _quartz_paste():
+        if not _osascript_paste():
+            log_warn("Auto-paste failed")
+            log_status(f"📋  Text:\n{text}")
 
 
 # ── PIPELINE ──────────────────────────────────────────────────────────────────
 
 def run_pipeline(model: "WhisperModel", audio: np.ndarray, mode: str) -> None:
-    """Orchestrate: transcribe → LLM → paste. Mode determines behaviour."""
+    """Orchestrate: transcribe → (LLM if answer) → paste. Mode determines behaviour."""
     try:
         # 1. STT
         log_status("⚙️  Transcribing...")
@@ -343,23 +410,22 @@ def run_pipeline(model: "WhisperModel", audio: np.ndarray, mode: str) -> None:
 
         log_status(f'📝  "{text}"')
 
-        # 2. LLM — route by mode
+        # 2. LLM — only for answer mode
         if mode == "dictation":
-            log_status("✏️  Refining dictation...")
-            system = DICTATION_PROMPT
+            # Paste raw transcription directly
+            paste_text(text)
+            log_status("✅  Done")
         else:
             log_status("🤖  Querying LLM...")
-            system = ANSWER_PROMPT
+            response = query_llm(text, ANSWER_PROMPT)
+            if response is None:
+                return
 
-        response = query_llm(text, system)
-        if response is None:
-            return
+            log_status(f'💬  "{response}"')
 
-        log_status(f'💬  "{response}"')
-
-        # 3. Paste
-        paste_text(response)
-        log_status("✅  Done")
+            # 3. Paste
+            paste_text(response)
+            log_status("✅  Done")
 
     except Exception as e:
         log_error(f"Pipeline error: {e}")
@@ -370,9 +436,13 @@ def run_pipeline(model: "WhisperModel", audio: np.ndarray, mode: str) -> None:
 
 # ── HOTKEY HANDLING ───────────────────────────────────────────────────────────
 
+# Debounce: prevent rapid re-triggering of the same hotkey combo
+_last_toggle_time: float = 0.0
+_toggle_cooldown_s: float = 0.5  # minimum seconds between toggles
+
 def on_key_press(key: Union[Key, KeyCode, None], model: "WhisperModel") -> None:
-    """Handle key press — detect which mode's combo is held."""
-    global _active_mode
+    """Handle key press — toggle recording on/off when combo is pressed."""
+    global _active_mode, _last_toggle_time
     normalized = _normalize_key(key)
     if normalized is None:
         return
@@ -380,9 +450,11 @@ def on_key_press(key: Union[Key, KeyCode, None], model: "WhisperModel") -> None:
     log_debug(f"PRESS   raw={key!r}  norm={normalized!r}  held={_pressed_keys}")
     _pressed_keys.add(normalized)
 
-    # Already recording or processing — ignore
-    if _is_recording.is_set():
+    # Debounce: ignore if toggled too recently
+    if time.time() - _last_toggle_time < _toggle_cooldown_s:
         return
+
+    # Pipeline still busy — ignore
     if _pipeline_busy.is_set():
         log_warn("Still processing...")
         return
@@ -394,62 +466,55 @@ def on_key_press(key: Union[Key, KeyCode, None], model: "WhisperModel") -> None:
     elif _combo_held(HOTKEY_ANSWER):
         mode = "answer"
 
-    if mode is not None:
+    if mode is None:
+        return
+
+    # Toggle behavior
+    if _is_recording.is_set():
+        # Currently recording → stop and trigger pipeline
+        _is_recording.clear()
+        _last_toggle_time = time.time()
+        log_status("✋  Stopped")
+
+        with _frames_lock:
+            frames = list(_audio_frames)
+            _audio_frames.clear()
+
+        if not frames:
+            return
+
+        audio = np.concatenate(frames, axis=0).flatten()
+        duration = len(audio) / SAMPLE_RATE
+
+        if duration < MIN_RECORDING_S:
+            log_warn("Too short, skipping.")
+            return
+
+        _pipeline_busy.set()
+        thread = threading.Thread(
+            target=run_pipeline, args=(model, audio, mode), daemon=True
+        )
+        thread.start()
+    else:
+        # Not recording → start recording
         with _mode_lock:
             _active_mode = mode
         with _frames_lock:
             _audio_frames.clear()
         _is_recording.set()
+        _last_toggle_time = time.time()
         label = "📝  Dictation" if mode == "dictation" else "💡  Answer"
-        log_status(f"🎙  Recording... ({label} mode)")
+        log_status(f"🎙  Recording... ({label} mode) — press hotkey again to stop")
 
 
 def on_key_release(key: Union[Key, KeyCode, None], model: "WhisperModel") -> None:
-    """Handle key release — stops recording and kicks off pipeline."""
-    global _active_mode
+    """Handle key release — just tracks key state, no recording control."""
     normalized = _normalize_key(key)
     if normalized is None:
         return
 
     log_debug(f"RELEASE raw={key!r}  norm={normalized!r}  held={_pressed_keys}")
     _pressed_keys.discard(normalized)
-
-    if not _is_recording.is_set():
-        return
-
-    # Check if the active mode's combo is still fully held
-    with _mode_lock:
-        mode = _active_mode
-
-    if mode == "dictation" and _combo_held(HOTKEY_DICTATION):
-        return  # Still holding — keep recording
-    if mode == "answer" and _combo_held(HOTKEY_ANSWER):
-        return  # Still holding — keep recording
-
-    # Combo broken → stop recording
-    _is_recording.clear()
-    log_status("✋  Stopped")
-
-    with _frames_lock:
-        frames = list(_audio_frames)
-        _audio_frames.clear()
-
-    # No frames captured
-    if not frames:
-        return
-
-    audio = np.concatenate(frames, axis=0).flatten()
-    duration = len(audio) / SAMPLE_RATE
-
-    if duration < MIN_RECORDING_S:
-        log_warn("Too short, skipping.")
-        return
-
-    _pipeline_busy.set()
-    thread = threading.Thread(
-        target=run_pipeline, args=(model, audio, mode or "answer"), daemon=True
-    )
-    thread.start()
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -488,8 +553,8 @@ def main() -> None:
     listener.start()
 
     log_status("🚀  Ready!")
-    log_status("    📝  Cmd+Shift+.  →  Dictation (refines speech → pastes clean text)")
-    log_status("    💡  Cmd+Shift+,  →  Answer    (asks LLM → pastes response)")
+    log_status("    📝  Cmd+Shift+0  →  Dictation (press to start, press again to stop)")
+    log_status("    💡  Cmd+Shift+9  →  Answer    (press to start, press again to stop)")
     if DEBUG_KEYS:
         log_status("    ⚡  DEBUG_KEYS is ON — all keypresses will be logged")
     log_status("    Press Ctrl+C to quit\n")

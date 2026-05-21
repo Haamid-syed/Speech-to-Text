@@ -31,6 +31,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Project specific
+context.md
+run.sh
+
 # IDE / Editor
 .vscode/*
 !.vscode/settings.json

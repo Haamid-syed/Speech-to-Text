@@ -10,8 +10,8 @@ numpy>=1.24.0,<2.0.0
 sounddevice>=0.4.6,<0.5.0
 pynput>=1.7.6,<1.8.0
 pyperclip>=1.8.2,<1.9.0
-pyautogui>=0.9.54,<1.0.0
 ollama>=0.4.0,<1.0.0
+pyobjc-framework-Quartz>=12.1
 
 # Install AFTER the above, with Metal flag:
 # CMAKE_ARGS="-DWHISPER_METAL=ON" pip install pywhispercpp

@@ -81,9 +81,9 @@ python voice_assistant.py
 | `Cmd+Shift+.` | **Dictation** | Cleans up your speech (fixes grammar, removes filler words) and pastes the refined text |
 | `Cmd+Shift+,` | **Answer** | Sends your speech as a question to the LLM and pastes the answer |
 
-1. **Hold** the hotkey → mic starts recording
-2. **Speak** clearly
-3. **Release** → transcription → LLM processing → auto-paste at cursor
+1. **Press once** the hotkey → mic starts recording
+2. **Speak** clearly — no need to keep holding the keys
+3. **Press the hotkey again** → recording stops → transcription → LLM processing → auto-paste at cursor
 
 Press `Ctrl+C` to quit.
 
